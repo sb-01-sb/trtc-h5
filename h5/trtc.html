@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>视频通话</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #0c0c0f; font-family: -apple-system, sans-serif; }
+
+    /* 远端视频全屏 */
+    #remote-wrap {
+      position: fixed; left: 0; top: 0; width: 100vw; height: 100vh;
+      background: #000; z-index: 1;
+    }
+    #remote-wrap video { width: 100%; height: 100%; object-fit: cover; }
+
+    /* 本地视频小窗 */
+    #local-wrap {
+      position: fixed; right: 12px; top: 60px;
+      width: 120px; height: 160px; border-radius: 10px;
+      background: #1a1a1a; z-index: 10; overflow: hidden;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.5);
+    }
+    #local-wrap video { width: 100%; height: 100%; object-fit: cover; }
+
+    /* 等待区 */
+    #waiting {
+      position: fixed; left: 0; top: 0; width: 100vw; height: 100vh;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      background: linear-gradient(165deg, #3d3d46 0%, #232329 38%, #0c0c0f 100%);
+      z-index: 50; color: #fff;
+    }
+    #waiting.hidden { display: none; }
+    .wait-avatar { width: 100px; height: 100px; border-radius: 18px; margin-bottom: 20px; background: #444; }
+    .wait-name { font-size: 22px; font-weight: 600; margin-bottom: 10px; }
+    .wait-status { font-size: 14px; color: rgba(255,255,255,0.65); }
+
+    /* 通话计时 */
+    #timer {
+      position: fixed; top: 24px; left: 0; right: 0; text-align: center; z-index: 20;
+      font-size: 15px; color: rgba(255,255,255,0.9);
+    }
+    #timer span {
+      background: rgba(0,0,0,0.45); padding: 4px 16px; border-radius: 14px; letter-spacing: 1px;
+    }
+
+    /* 网络提示 */
+    #network-tip {
+      position: fixed; top: 56px; left: 0; right: 0; text-align: center; z-index: 20;
+      font-size: 12px; color: #ffa940;
+    }
+    #network-tip.hidden { display: none; }
+
+    /* 底部控制栏 */
+    #controls {
+      position: fixed; bottom: 0; left: 0; right: 0; z-index: 30;
+      display: flex; align-items: flex-start; justify-content: space-evenly;
+      padding: 16px 10px calc(24px + env(safe-area-inset-bottom));
+      background: linear-gradient(180deg, transparent 0%, rgba(0,0,0,0.55) 100%);
+    }
+    .ctrl { display: flex; flex-direction: column; align-items: center; min-width: 60px; }
+    .ctrl-btn {
+      width: 56px; height: 56px; border-radius: 50%; border: none; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      margin-bottom: 6px; font-size: 22px;
+      box-shadow: 0 3px 10px rgba(0,0,0,0.3); transition: opacity 0.2s;
+    }
+    .ctrl-btn.light { background: rgba(255,255,255,0.92); }
+    .ctrl-btn.dim { opacity: 0.45; }
+    .ctrl-btn.hangup-btn {
+      background: linear-gradient(180deg, #ff5a5f 0%, #e02020 100%);
+      width: 60px; height: 60px; color: #fff; font-size: 26px; font-weight: bold;
+      box-shadow: 0 4px 14px rgba(224,32,32,0.45);
+    }
+    .ctrl-label { font-size: 11px; color: rgba(255,255,255,0.85); text-align: center; }
+  </style>
+</head>
+<body>
+
+  <!-- 等待区 -->
+  <div id="waiting">
+    <div class="wait-avatar" id="waitAvatar"></div>
+    <div class="wait-name" id="waitName">对方</div>
+    <div class="wait-status" id="waitStatus">正在连接...</div>
+  </div>
+
+  <!-- 远端视频 -->
+  <div id="remote-wrap"></div>
+
+  <!-- 本地视频 -->
+  <div id="local-wrap"></div>
+
+  <!-- 通话计时 -->
+  <div id="timer"><span id="timerText">00:00</span></div>
+
+  <!-- 网络提示 -->
+  <div id="network-tip" class="hidden"></div>
+
+  <!-- 控制栏 -->
+  <div id="controls">
+    <div class="ctrl" onclick="toggleMic()">
+      <button class="ctrl-btn light" id="micBtn">🎤</button>
+      <span class="ctrl-label" id="micLabel">麦克风</span>
+    </div>
+    <div class="ctrl" onclick="toggleCamera()">
+      <button class="ctrl-btn light" id="camBtn">📷</button>
+      <span class="ctrl-label" id="camLabel">摄像头</span>
+    </div>
+    <div class="ctrl" onclick="switchCamera()">
+      <button class="ctrl-btn light">🔄</button>
+      <span class="ctrl-label">翻转</span>
+    </div>
+    <div class="ctrl" onclick="hangup()">
+      <button class="ctrl-btn hangup-btn">✕</button>
+      <span class="ctrl-label">挂断</span>
+    </div>
+  </div>
+
+  <!-- 微信 JSSDK（web-view 与小程序通信） -->
+  <script src="https://res.wx.qq.com/open/js/jweixin-1.6.0.js"></script>
+  <!-- TRTC Web SDK -->
+  <script src="https://web.sdk.qcloud.com/trtc/webrtc/v5/dist/trtc.js"></script>
+
+  <script>
+    // ===================== 解析 URL 参数 =====================
+    function getParam(name) {
+      var reg = new RegExp('(^|&)' + name + '=([^&]*)(&|$)');
+      var r = window.location.search.substr(1).match(reg);
+      return r ? decodeURIComponent(r[2]) : '';
+    }
+
+    var sdkAppId = parseInt(getParam('sdkAppId')) || 0;
+    var userId   = getParam('userId') || '';
+    var userSig  = getParam('userSig') || '';
+    var roomId   = parseInt(getParam('roomId')) || 0;
+    var role     = getParam('role') || 'caller';
+    var peerName = getParam('name') || '对方';
+    var peerAvatar = getParam('avatar') || '';
+
+    // 显示等待信息
+    document.getElementById('waitName').textContent = peerName;
+    if (peerAvatar) {
+      var av = document.getElementById('waitAvatar');
+      av.style.backgroundImage = 'url(' + peerAvatar + ')';
+      av.style.backgroundSize = 'cover';
+    }
+
+    // ===================== 状态 =====================
+    var trtcClient = null;
+    var localStream = null;
+    var micOn = true;
+    var camOn = true;
+    var useFront = true;
+    var duration = 0;
+    var durationTimer = null;
+    var connected = false;
+
+    // ===================== 进入房间 =====================
+    async function startCall() {
+      if (!sdkAppId || !userId || !userSig || !roomId) {
+        document.getElementById('waitStatus').textContent = '参数缺失，无法连接';
+        return;
+      }
+      document.getElementById('waitStatus').textContent = '正在连接...';
+
+      try {
+        trtcClient = TRTC.create();
+
+        // 监听远端流
+        trtcClient.on(TRTC.EVENT.REMOTE_VIDEO_AVAILABLE, function(event) {
+          var remoteUserId = event.userId;
+          var remoteWrap = document.getElementById('remote-wrap');
+          // 播放远端视频
+          trtcClient.startRemoteVideo({ userId: remoteUserId, view: remoteWrap });
+          // 隐藏等待区
+          document.getElementById('waiting').classList.add('hidden');
+          connected = true;
+          startDurationTimer();
+        });
+
+        trtcClient.on(TRTC.EVENT.REMOTE_VIDEO_UNAVAILABLE, function(event) {
+          // 远端关闭了摄像头
+        });
+
+        trtcClient.on(TRTC.EVENT.REMOTE_USER_LEAVE, function(event) {
+          // 对方离开
+          if (connected) {
+            endCall('对方已断开');
+          }
+        });
+
+        trtcClient.on(TRTC.EVENT.NETWORK_QUALITY, function(event) {
+          var tip = document.getElementById('network-tip');
+          if (event.uplinkNetworkQuality >= 4 || event.downlinkNetworkQuality >= 4) {
+            tip.textContent = '网络较差，通话可能不稳定';
+            tip.classList.remove('hidden');
+          } else if (event.uplinkNetworkQuality >= 3) {
+            tip.textContent = '网络一般';
+            tip.classList.remove('hidden');
+          } else {
+            tip.classList.add('hidden');
+          }
+        });
+
+        trtcClient.on(TRTC.EVENT.ERROR, function(event) {
+          console.error('TRTC error:', event);
+          endCall('连接异常');
+        });
+
+        // 进入房间
+        await trtcClient.enterRoom({
+          sdkAppId: sdkAppId,
+          userId: userId,
+          userSig: userSig,
+          roomId: roomId,
+          scene: 'rtc'
+        });
+
+        // 开启本地摄像头+麦克风
+        await trtcClient.startLocalVideo({
+          view: document.getElementById('local-wrap'),
+          publish: true
+        });
+        await trtcClient.startLocalAudio({ publish: true });
+
+        document.getElementById('waitStatus').textContent = '等待对方加入...';
+
+      } catch (err) {
+        console.error('startCall error:', err);
+        document.getElementById('waitStatus').textContent = '连接失败: ' + (err.message || err);
+      }
+    }
+
+    // ===================== 通话控制 =====================
+    function toggleMic() {
+      micOn = !micOn;
+      if (trtcClient) {
+        if (micOn) {
+          trtcClient.updateLocalAudio({ mute: false });
+        } else {
+          trtcClient.updateLocalAudio({ mute: true });
+        }
+      }
+      document.getElementById('micBtn').className = 'ctrl-btn light' + (micOn ? '' : ' dim');
+      document.getElementById('micLabel').textContent = micOn ? '麦克风' : '已静音';
+    }
+
+    function toggleCamera() {
+      camOn = !camOn;
+      if (trtcClient) {
+        if (camOn) {
+          trtcClient.startLocalVideo({
+            view: document.getElementById('local-wrap'),
+            publish: true
+          });
+        } else {
+          trtcClient.stopLocalVideo();
+        }
+      }
+      document.getElementById('camBtn').className = 'ctrl-btn light' + (camOn ? '' : ' dim');
+      document.getElementById('camLabel').textContent = camOn ? '摄像头' : '已关闭';
+    }
+
+    function switchCamera() {
+      useFront = !useFront;
+      if (trtcClient) {
+        trtcClient.updateLocalVideo({
+          option: { cameraId: '', facingMode: useFront ? 'user' : 'environment' }
+        });
+      }
+    }
+
+    function hangup() {
+      endCall('通话结束');
+    }
+
+    async function endCall(reason) {
+      stopDurationTimer();
+      try {
+        if (trtcClient) {
+          await trtcClient.stopLocalVideo();
+          await trtcClient.stopLocalAudio();
+          await trtcClient.exitRoom();
+          trtcClient.destroy();
+          trtcClient = null;
+        }
+      } catch (e) {
+        console.warn('exitRoom error:', e);
+      }
+
+      // 通知小程序
+      if (window.wx && wx.miniProgram) {
+        wx.miniProgram.postMessage({
+          data: {
+            type: 'CALL_END',
+            duration: duration,
+            reason: reason || '通话结束'
+          }
+        });
+        // 返回小程序
+        setTimeout(function() {
+          wx.miniProgram.navigateBack({ delta: 1 });
+        }, 800);
+      }
+
+      // 显示结束提示
+      var w = document.getElementById('waiting');
+      w.classList.remove('hidden');
+      document.getElementById('waitStatus').textContent = reason || '通话结束';
+    }
+
+    // ===================== 通话计时 =====================
+    function startDurationTimer() {
+      duration = 0;
+      stopDurationTimer();
+      durationTimer = setInterval(function() {
+        duration++;
+        var m = Math.floor(duration / 60);
+        var s = duration % 60;
+        document.getElementById('timerText').textContent =
+          (m < 10 ? '0' + m : m) + ':' + (s < 10 ? '0' + s : s);
+      }, 1000);
+    }
+
+    function stopDurationTimer() {
+      if (durationTimer) { clearInterval(durationTimer); durationTimer = null; }
+    }
+
+    // ===================== 页面卸载时清理 =====================
+    window.addEventListener('beforeunload', function() {
+      if (trtcClient) {
+        try { trtcClient.exitRoom(); trtcClient.destroy(); } catch(e) {}
+      }
+    });
+
+    // ===================== 自动开始 =====================
+    startCall();
+  </script>
+</body>
+</html>
